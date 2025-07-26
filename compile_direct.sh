@@ -132,6 +132,26 @@ else
     exit 1
 fi
 
+print_status "Compiling epoll-optimized server executable..."
+
+# Compile epoll server
+g++ $CXX_FLAGS $INCLUDE_FLAGS \
+    ../src/main_epoll.cpp \
+    ../src/EpollServer.cpp \
+    ../src/HelloService.cpp \
+    ../src/LoggingInterceptor.cpp \
+    HelloService.pb.cc \
+    HelloService.grpc.pb.cc \
+    $PROTOBUF_FLAGS $GRPC_PLUS_PLUS_FLAGS \
+    -o gRpcSvr_epoll
+
+if [ $? -eq 0 ]; then
+    print_success "Epoll server compiled successfully"
+else
+    print_error "Epoll server compilation failed"
+    exit 1
+fi
+
 print_status "Compiling client executable..."
 
 # Compile client
@@ -200,12 +220,31 @@ else
     exit 1
 fi
 
+print_status "Compiling epoll performance test executable..."
+
+# Compile epoll performance test
+g++ $CXX_FLAGS $INCLUDE_FLAGS \
+    ../src/epoll_performance_test.cpp \
+    -o gRpcSvr_epoll_perf_test
+
+if [ $? -eq 0 ]; then
+    print_success "Epoll performance test compiled successfully"
+else
+    print_error "Epoll performance test compilation failed"
+    exit 1
+fi
+
 # List generated executables
 echo ""
 print_status "Generated executables:"
 if [ -f "gRpcSvr_optimized" ]; then
     echo -e "  ${GREEN}✓${NC} gRpcSvr_optimized (Optimized Server)"
     ls -lh gRpcSvr_optimized
+fi
+
+if [ -f "gRpcSvr_epoll" ]; then
+    echo -e "  ${GREEN}✓${NC} gRpcSvr_epoll (Epoll-Optimized Server)"
+    ls -lh gRpcSvr_epoll
 fi
 
 if [ -f "gRpcSvr_client" ]; then
@@ -228,6 +267,11 @@ if [ -f "gRpcSvr_latency_test" ]; then
     ls -lh gRpcSvr_latency_test
 fi
 
+if [ -f "gRpcSvr_epoll_perf_test" ]; then
+    echo -e "  ${GREEN}✓${NC} gRpcSvr_epoll_perf_test (Epoll Performance Test)"
+    ls -lh gRpcSvr_epoll_perf_test
+fi
+
 echo ""
 print_success "Direct compilation completed successfully!"
 echo "All executables are in the build_direct directory."
@@ -235,13 +279,17 @@ echo ""
 print_status "To run the optimized server:"
 echo "  cd build_direct && ./gRpcSvr_optimized"
 echo ""
-print_status "To run latency tests:"
-echo "  cd build_direct && ./gRpcSvr_latency_test"
+print_status "To run the epoll-optimized server:"
+echo "  cd build_direct && ./gRpcSvr_epoll"
+echo ""
+print_status "To run epoll performance tests:"
+echo "  cd build_direct && ./gRpcSvr_epoll_perf_test"
 echo ""
 print_status "To run other tests:"
 echo "  cd build_direct && ./gRpcSvr_client"
 echo "  cd build_direct && ./gRpcSvr_perf_test"
 echo "  cd build_direct && ./gRpcSvr_simple_perf"
+echo "  cd build_direct && ./gRpcSvr_latency_test"
 
 echo ""
 echo "=========================================="
@@ -255,4 +303,7 @@ echo "✓ Performance Testing Framework"
 echo "✓ Direct g++ compilation (No CMake)"
 echo "✓ Optimized for high performance"
 echo "✓ Specialized latency testing"
+echo "✓ Epoll-optimized server with I/O multiplexing"
+echo "✓ Edge-triggered event handling"
+echo "✓ Non-blocking socket operations"
 echo "==========================================" 
