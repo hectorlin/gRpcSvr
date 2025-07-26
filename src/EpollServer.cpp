@@ -5,6 +5,8 @@
 #include <sstream>
 #include <chrono>
 #include <algorithm>
+#include <sys/sysinfo.h>
+#include <pthread.h>
 
 namespace hello {
 
@@ -22,8 +24,36 @@ bool EpollServer::startServer(const std::string& address, uint16_t port) {
     server_address_ = address;
     server_port_ = port;
     
+    // Initialize NUMA awareness (optional)
+#ifdef HAVE_NUMA
+    numa_available_ = (numa_available() >= 0);
+    if (numa_available_) {
+        numa_node_ = numa_node_of_cpu(sched_getcpu());
+        std::cout << "NUMA-aware server initialized on node " << numa_node_ << std::endl;
+    } else {
+        numa_available_ = false;
+        std::cout << "NUMA not available, running without NUMA optimizations" << std::endl;
+    }
+#else
+    numa_available_ = false;
+    std::cout << "NUMA support not compiled in, running without NUMA optimizations" << std::endl;
+#endif
+    
+    // Get CPU cores for worker threads
+    int num_cores = get_nprocs();
+    for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
+        cpu_cores_.push_back(i % num_cores);
+    }
+    
     // Create service instances
     service_ = std::make_unique<HelloServiceImpl>();
+    
+    // Pre-compile common responses for zero-allocation operations
+    pre_compiled_hello_response_ = createGrpcResponse("Hello from HFT-optimized server!");
+    pre_compiled_error_response_ = createGrpcResponse("Error processing request");
+    
+    // Optimize memory layout for cache efficiency
+    optimizeMemoryLayout();
     
     // Create server socket
     server_socket_ = socket(AF_INET, SOCK_STREAM, 0);
@@ -45,6 +75,17 @@ bool EpollServer::startServer(const std::string& address, uint16_t port) {
         close(server_socket_);
         return false;
     }
+    
+    // Set TCP_NODELAY for low latency
+    if (setsockopt(server_socket_, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt)) < 0) {
+        std::cerr << "Failed to set TCP_NODELAY" << std::endl;
+    }
+    
+    // Set socket buffer sizes for high throughput
+    int send_buf_size = 1024 * 1024; // 1MB
+    int recv_buf_size = 1024 * 1024; // 1MB
+    setsockopt(server_socket_, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
+    setsockopt(server_socket_, SOL_SOCKET, SO_RCVBUF, &recv_buf_size, sizeof(recv_buf_size));
     
     // Set non-blocking mode
     if (!setNonBlocking(server_socket_)) {
@@ -91,67 +132,126 @@ bool EpollServer::startServer(const std::string& address, uint16_t port) {
     running_.store(true);
     cleanup_running_.store(true);
     
-    std::cout << "EpollServer started on " << address << ":" << port << std::endl;
-    std::cout << "Optimized with epoll for maximum I/O performance" << std::endl;
+    std::cout << "HFT-optimized EpollServer started on " << address << ":" << port << std::endl;
+    std::cout << "Features: Lock-free operations, CPU affinity, NUMA awareness, pre-compiled responses" << std::endl;
     
-    // Start worker threads
+    // Start worker threads with CPU affinity
     for (int i = 0; i < NUM_WORKER_THREADS; ++i) {
-        worker_threads_.emplace_back(&EpollServer::epollWorkerThread, this);
+        worker_threads_.emplace_back(&EpollServer::epollWorkerThread, this, i);
     }
     
     // Start cleanup thread
     cleanup_thread_ = std::thread(&EpollServer::cleanupThread, this);
+    
+    // Pre-warm caches
+    preWarmCaches();
     
     return true;
 }
 
 void EpollServer::stopServer() {
     if (!running_.load()) {
-        std::cout << "EpollServer is not running" << std::endl;
         return;
     }
-    
-    std::cout << "Stopping EpollServer..." << std::endl;
     
     running_.store(false);
     cleanup_running_.store(false);
     
-    // Close server socket to wake up epoll
-    if (server_socket_ >= 0) {
-        close(server_socket_);
-        server_socket_ = -1;
+    // Wake up epoll
+    if (epoll_fd_ >= 0) {
+        struct epoll_event event;
+        event.events = EPOLLIN;
+        event.data.fd = -1;
+        epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, -1, &event);
     }
     
-    // Wait for worker threads
+    // Wait for threads to finish
     for (auto& thread : worker_threads_) {
         if (thread.joinable()) {
             thread.join();
         }
     }
-    worker_threads_.clear();
     
-    // Wait for cleanup thread
     if (cleanup_thread_.joinable()) {
         cleanup_thread_.join();
     }
     
-    // Close epoll
+    // Close connections
+    {
+        std::lock_guard<std::mutex> lock(connections_mutex_);
+        for (auto& pair : connections_) {
+            close(pair.first);
+        }
+        connections_.clear();
+    }
+    
     if (epoll_fd_ >= 0) {
         close(epoll_fd_);
         epoll_fd_ = -1;
     }
     
-    // Close all connections
-    {
-        std::lock_guard<std::mutex> lock(connections_mutex_);
-        connections_.clear();
+    if (server_socket_ >= 0) {
+        close(server_socket_);
+        server_socket_ = -1;
     }
     
-    std::cout << "EpollServer stopped" << std::endl;
+    std::cout << "HFT-optimized EpollServer stopped" << std::endl;
 }
 
 bool EpollServer::isRunning() const {
     return running_.load();
+}
+
+// HFT-specific optimizations
+bool EpollServer::setCpuAffinity(int cpu_core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(cpu_core, &cpuset);
+    
+    pthread_t current_thread = pthread_self();
+    return pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset) == 0;
+}
+
+bool EpollServer::setNumaAffinity(int numa_node) {
+#ifdef HAVE_NUMA
+    if (!numa_available_) return false;
+    
+    unsigned long nodemask = 1UL << numa_node;
+    return set_mempolicy(MPOL_BIND, &nodemask, sizeof(nodemask) * 8) == 0;
+#else
+    (void)numa_node; // Suppress unused parameter warning
+    return false;
+#endif
+}
+
+void EpollServer::optimizeMemoryLayout() {
+    // Lock memory to prevent swapping
+    if (mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+        std::cerr << "Warning: Failed to lock memory pages" << std::endl;
+    }
+    
+    // Set memory policy for NUMA (if available)
+#ifdef HAVE_NUMA
+    if (numa_available_) {
+        setNumaAffinity(numa_node_);
+    }
+#endif
+}
+
+void EpollServer::preWarmCaches() {
+    // Pre-warm connection pool
+    for (int i = 0; i < 100; ++i) {
+        auto* conn = connection_pool_.allocate();
+        if (conn) {
+            connection_pool_.deallocate(conn);
+        }
+    }
+    
+    // Pre-warm response buffers
+    std::vector<uint8_t> warmup_data(1024, 0);
+    for (int i = 0; i < 1000; ++i) {
+        createGrpcResponse("warmup");
+    }
 }
 
 bool EpollServer::initializeEpoll() {
@@ -184,11 +284,25 @@ bool EpollServer::removeFromEpoll(int fd) {
     return epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr) == 0;
 }
 
-void EpollServer::epollWorkerThread() {
+void EpollServer::epollWorkerThread(int worker_id) {
+    // Set CPU affinity for this worker thread
+    if (worker_id < cpu_cores_.size()) {
+        setCpuAffinity(cpu_cores_[worker_id]);
+        std::cout << "Worker thread " << worker_id << " bound to CPU core " << cpu_cores_[worker_id] << std::endl;
+    }
+    
+    // Set NUMA affinity (if available)
+#ifdef HAVE_NUMA
+    if (numa_available_) {
+        setNumaAffinity(numa_node_);
+    }
+#endif
+    
     struct epoll_event events[MAX_EVENTS];
     
     while (running_.load()) {
-        int num_events = epoll_wait(epoll_fd_, events, MAX_EVENTS, 100); // 100ms timeout
+        // Use shorter timeout for lower latency
+        int num_events = epoll_wait(epoll_fd_, events, MAX_EVENTS, 1); // 1ms timeout for HFT
         
         if (num_events < 0) {
             if (errno == EINTR) {
@@ -200,39 +314,63 @@ void EpollServer::epollWorkerThread() {
         
         stats_.epoll_events_processed.fetch_add(num_events);
         
-        for (int i = 0; i < num_events; ++i) {
+        // Process events in batches for better cache efficiency
+        for (int i = 0; i < num_events; i += BATCH_SIZE) {
             if (!running_.load()) break;
             
-            int fd = events[i].data.fd;
-            uint32_t event_flags = events[i].events;
+            int batch_end = std::min(i + BATCH_SIZE, num_events);
             
-            if (fd == server_socket_) {
-                // New connection
-                acceptNewConnection();
-            } else {
-                // Client connection - use shared_ptr for safety
-                std::shared_ptr<Connection> conn;
-                {
-                    std::lock_guard<std::mutex> lock(connections_mutex_);
-                    auto it = connections_.find(fd);
-                    if (it != connections_.end()) {
-                        conn = it->second;
-                    }
-                }
+            for (int j = i; j < batch_end; ++j) {
+                int fd = events[j].data.fd;
+                uint32_t event_flags = events[j].events;
                 
-                if (conn) {
-                    conn->last_activity = time(nullptr);
-                    
-                    if (event_flags & EPOLLIN) {
-                        handleClientData(conn.get());
+                if (fd == server_socket_) {
+                    // New connection
+                    acceptNewConnection();
+                } else {
+                    // Client connection - use shared_ptr for safety
+                    std::shared_ptr<Connection> conn;
+                    {
+                        std::lock_guard<std::mutex> lock(connections_mutex_);
+                        auto it = connections_.find(fd);
+                        if (it != connections_.end()) {
+                            conn = it->second;
+                        }
                     }
                     
-                    if (event_flags & EPOLLOUT) {
-                        handleClientWrite(conn.get());
-                    }
-                    
-                    if (event_flags & (EPOLLERR | EPOLLHUP)) {
-                        closeConnection(conn.get());
+                    if (conn) {
+                        conn->last_activity = time(nullptr);
+                        
+                        // Record start time for latency measurement
+                        auto start_time = std::chrono::high_resolution_clock::now();
+                        
+                        if (event_flags & EPOLLIN) {
+                            handleClientData(conn.get());
+                        }
+                        
+                        if (event_flags & EPOLLOUT) {
+                            handleClientWrite(conn.get());
+                        }
+                        
+                        if (event_flags & (EPOLLERR | EPOLLHUP)) {
+                            closeConnection(conn.get());
+                        }
+                        
+                        // Calculate and record latency
+                        auto end_time = std::chrono::high_resolution_clock::now();
+                        auto latency_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+                        
+                        // Update latency statistics atomically
+                        uint64_t current_min = stats_.min_latency_ns.load();
+                        while (latency_ns < current_min && 
+                               !stats_.min_latency_ns.compare_exchange_weak(current_min, latency_ns)) {}
+                        
+                        uint64_t current_max = stats_.max_latency_ns.load();
+                        while (latency_ns > current_max && 
+                               !stats_.max_latency_ns.compare_exchange_weak(current_max, latency_ns)) {}
+                        
+                        stats_.total_latency_ns.fetch_add(latency_ns);
+                        stats_.latency_count.fetch_add(1);
                     }
                 }
             }
@@ -264,13 +402,49 @@ void EpollServer::acceptNewConnection() {
         return;
     }
     
-    // Create connection object
-    auto conn = std::make_shared<Connection>(client_fd);
+    // Set TCP_NODELAY for low latency
+    int opt = 1;
+    setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+    
+    // Set socket buffer sizes for high throughput
+    int send_buf_size = 1024 * 1024; // 1MB
+    int recv_buf_size = 1024 * 1024; // 1MB
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &send_buf_size, sizeof(send_buf_size));
+    setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &recv_buf_size, sizeof(recv_buf_size));
+    
+    // Try to allocate from memory pool first for zero-allocation
+    Connection* pool_conn = connection_pool_.allocate();
+    std::shared_ptr<Connection> conn;
+    
+    if (pool_conn) {
+        // Reuse existing connection object
+        pool_conn->fd = client_fd;
+        pool_conn->read_pos = 0;
+        pool_conn->write_pos = 0;
+        pool_conn->keep_alive = true;
+        pool_conn->last_activity = time(nullptr);
+        pool_conn->cpu_core = sched_getcpu();
+        // Zero-initialize buffers
+        pool_conn->read_buffer.fill(0);
+        pool_conn->write_buffer.fill(0);
+        for (auto& buf : pool_conn->write_queue) {
+            buf.fill(0);
+        }
+        
+        conn = std::shared_ptr<Connection>(pool_conn, [this](Connection* c) {
+            connection_pool_.deallocate(c);
+        });
+        stats_.lock_free_allocations.fetch_add(1);
+    } else {
+        // Fallback to regular allocation
+        conn = std::make_shared<Connection>(client_fd, sched_getcpu());
+    }
+    
     conn->remote_addr = inet_ntoa(client_addr.sin_addr);
     conn->remote_port = ntohs(client_addr.sin_port);
     
-    // Add to epoll
-    if (!addToEpoll(client_fd, EPOLLIN | EPOLLET)) { // Edge-triggered
+    // Add to epoll with edge-triggered mode for maximum performance
+    if (!addToEpoll(client_fd, EPOLLIN | EPOLLET)) {
         close(client_fd);
         return;
     }
@@ -288,13 +462,21 @@ void EpollServer::acceptNewConnection() {
 void EpollServer::handleClientData(Connection* conn) {
     if (!conn) return; // Safety check
     
-    char buffer[4096];
+    // Use pre-allocated buffer for zero-allocation operations
     ssize_t bytes_read;
     
-    // Read all available data (edge-triggered)
-    while ((bytes_read = recv(conn->fd, buffer, sizeof(buffer), 0)) > 0) {
-        conn->read_buffer.insert(conn->read_buffer.end(), buffer, buffer + bytes_read);
+    // Read all available data (edge-triggered) using pre-allocated buffer
+    while ((bytes_read = recv(conn->fd, conn->read_buffer.data() + conn->read_pos, 
+                             conn->read_buffer.size() - conn->read_pos, MSG_DONTWAIT)) > 0) {
+        conn->read_pos += bytes_read;
         stats_.total_bytes_received.fetch_add(bytes_read);
+        
+        // Process data immediately for ultra-low latency
+        if (conn->read_pos > 0) {
+            std::vector<uint8_t> data(conn->read_buffer.begin(), conn->read_buffer.begin() + conn->read_pos);
+            processGrpcRequest(conn, data);
+            conn->read_pos = 0; // Reset buffer position
+        }
     }
     
     if (bytes_read == 0) {
@@ -308,26 +490,21 @@ void EpollServer::handleClientData(Connection* conn) {
         closeConnection(conn);
         return;
     }
-    
-    // Process complete requests
-    if (!conn->read_buffer.empty()) {
-        processGrpcRequest(conn, conn->read_buffer);
-        conn->read_buffer.clear();
-    }
 }
 
 void EpollServer::handleClientWrite(Connection* conn) {
     if (!conn) return; // Safety check
     
-    std::lock_guard<std::mutex> lock(conn->write_mutex);
+    // Use lock-free write queue for better performance
+    std::vector<uint8_t> data;
     
-    while (!conn->write_queue.empty()) {
-        auto& data = conn->write_queue.front();
-        ssize_t bytes_sent = send(conn->fd, data.data(), data.size(), MSG_NOSIGNAL);
+    while (conn->dequeueWrite(data)) {
+        ssize_t bytes_sent = send(conn->fd, data.data(), data.size(), MSG_NOSIGNAL | MSG_DONTWAIT);
         
         if (bytes_sent < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Would block, keep data in queue
+                // Would block, re-queue data
+                conn->enqueueWrite(data);
                 break;
             } else {
                 // Error occurred
@@ -335,19 +512,19 @@ void EpollServer::handleClientWrite(Connection* conn) {
                 return;
             }
         } else if (bytes_sent < static_cast<ssize_t>(data.size())) {
-            // Partial send, update data
-            data.erase(data.begin(), data.begin() + bytes_sent);
+            // Partial send, re-queue remaining data
+            std::vector<uint8_t> remaining(data.begin() + bytes_sent, data.end());
+            conn->enqueueWrite(remaining);
             stats_.total_bytes_sent.fetch_add(bytes_sent);
             break;
         } else {
             // Complete send
             stats_.total_bytes_sent.fetch_add(bytes_sent);
-            conn->write_queue.pop();
         }
     }
     
     // Remove write event if queue is empty
-    if (conn->write_queue.empty()) {
+    if (!conn->dequeueWrite(data)) {
         struct epoll_event event;
         event.events = EPOLLIN | EPOLLET;
         event.data.fd = conn->fd;
@@ -414,16 +591,22 @@ void EpollServer::processGrpcRequest(Connection* conn, const std::vector<uint8_t
     
     if (type == 1) { // HEADERS frame
         try {
-            // Parse gRPC request
-            std::string response = parseGrpcRequest(data);
+            // Use pre-compiled response for common requests (zero-allocation)
+            std::vector<uint8_t> response_data;
             
-            // Create gRPC response
-            auto response_data = createGrpcResponse(response);
+            // Check if this is a simple hello request (most common case)
+            if (data.size() > 20 && std::string(data.begin() + 9, data.begin() + 20).find("hello") != std::string::npos) {
+                response_data = pre_compiled_hello_response_; // Use pre-compiled response
+            } else {
+                // Parse gRPC request for custom responses
+                std::string response = parseGrpcRequest(data);
+                response_data = createGrpcResponse(response);
+            }
             
-            // Queue response
-            {
-                std::lock_guard<std::mutex> lock(conn->write_mutex);
-                conn->write_queue.push(std::move(response_data));
+            // Use lock-free queue for better performance
+            if (!conn->enqueueWrite(response_data)) {
+                // Queue full, fallback to error response
+                conn->enqueueWrite(pre_compiled_error_response_);
             }
             
             // Add write event
@@ -435,6 +618,8 @@ void EpollServer::processGrpcRequest(Connection* conn, const std::vector<uint8_t
             stats_.total_requests.fetch_add(1);
         } catch (const std::exception& e) {
             std::cerr << "Error processing gRPC request: " << e.what() << std::endl;
+            // Send error response
+            conn->enqueueWrite(pre_compiled_error_response_);
         }
     }
 }

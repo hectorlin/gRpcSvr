@@ -134,16 +134,38 @@ fi
 
 print_status "Compiling epoll-optimized server executable..."
 
+# Check if NUMA is available
+NUMA_AVAILABLE=false
+if pkg-config --exists numa; then
+    NUMA_AVAILABLE=true
+    NUMA_FLAGS=$(pkg-config --cflags --libs numa)
+    print_status "NUMA support detected, compiling with NUMA optimizations"
+else
+    print_warning "NUMA not available, compiling without NUMA optimizations"
+fi
+
 # Compile epoll server
-g++ $CXX_FLAGS $INCLUDE_FLAGS \
-    ../src/main_epoll.cpp \
-    ../src/EpollServer.cpp \
-    ../src/HelloService.cpp \
-    ../src/LoggingInterceptor.cpp \
-    HelloService.pb.cc \
-    HelloService.grpc.pb.cc \
-    $PROTOBUF_FLAGS $GRPC_PLUS_PLUS_FLAGS \
-    -o gRpcSvr_epoll
+if [ "$NUMA_AVAILABLE" = true ]; then
+    g++ $CXX_FLAGS $INCLUDE_FLAGS -DHAVE_NUMA \
+        ../src/main_epoll.cpp \
+        ../src/EpollServer.cpp \
+        ../src/HelloService.cpp \
+        ../src/LoggingInterceptor.cpp \
+        HelloService.pb.cc \
+        HelloService.grpc.pb.cc \
+        $PROTOBUF_FLAGS $GRPC_PLUS_PLUS_FLAGS $NUMA_FLAGS \
+        -o gRpcSvr_epoll
+else
+    g++ $CXX_FLAGS $INCLUDE_FLAGS \
+        ../src/main_epoll.cpp \
+        ../src/EpollServer.cpp \
+        ../src/HelloService.cpp \
+        ../src/LoggingInterceptor.cpp \
+        HelloService.pb.cc \
+        HelloService.grpc.pb.cc \
+        $PROTOBUF_FLAGS $GRPC_PLUS_PLUS_FLAGS \
+        -o gRpcSvr_epoll
+fi
 
 if [ $? -eq 0 ]; then
     print_success "Epoll server compiled successfully"
@@ -234,6 +256,27 @@ else
     exit 1
 fi
 
+print_status "Compiling HFT-optimized performance test executable..."
+
+# Compile HFT performance test
+if [ "$NUMA_AVAILABLE" = true ]; then
+    g++ $CXX_FLAGS $INCLUDE_FLAGS -DHAVE_NUMA \
+        ../src/hft_performance_test.cpp \
+        $NUMA_FLAGS \
+        -o gRpcSvr_hft_perf_test
+else
+    g++ $CXX_FLAGS $INCLUDE_FLAGS \
+        ../src/hft_performance_test.cpp \
+        -o gRpcSvr_hft_perf_test
+fi
+
+if [ $? -eq 0 ]; then
+    print_success "HFT performance test compiled successfully"
+else
+    print_error "HFT performance test compilation failed"
+    exit 1
+fi
+
 # List generated executables
 echo ""
 print_status "Generated executables:"
@@ -272,6 +315,11 @@ if [ -f "gRpcSvr_epoll_perf_test" ]; then
     ls -lh gRpcSvr_epoll_perf_test
 fi
 
+if [ -f "gRpcSvr_hft_perf_test" ]; then
+    echo -e "  ${GREEN}✓${NC} gRpcSvr_hft_perf_test (HFT Performance Test)"
+    ls -lh gRpcSvr_hft_perf_test
+fi
+
 echo ""
 print_success "Direct compilation completed successfully!"
 echo "All executables are in the build_direct directory."
@@ -284,6 +332,9 @@ echo "  cd build_direct && ./gRpcSvr_epoll"
 echo ""
 print_status "To run epoll performance tests:"
 echo "  cd build_direct && ./gRpcSvr_epoll_perf_test"
+echo ""
+print_status "To run HFT performance tests:"
+echo "  cd build_direct && ./gRpcSvr_hft_perf_test 127.0.0.1 50052"
 echo ""
 print_status "To run other tests:"
 echo "  cd build_direct && ./gRpcSvr_client"
@@ -306,4 +357,8 @@ echo "✓ Specialized latency testing"
 echo "✓ Epoll-optimized server with I/O multiplexing"
 echo "✓ Edge-triggered event handling"
 echo "✓ Non-blocking socket operations"
+echo "✓ HFT-optimized server with lock-free operations"
+echo "✓ CPU affinity and NUMA awareness"
+echo "✓ Pre-compiled responses and memory pools"
+echo "✓ Ultra-low latency optimizations"
 echo "==========================================" 
