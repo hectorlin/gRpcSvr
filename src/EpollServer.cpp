@@ -49,8 +49,15 @@ bool EpollServer::startServer(const std::string& address, uint16_t port) {
     service_ = std::make_unique<HelloServiceImpl>();
     
     // Pre-compile common responses for zero-allocation operations
-    pre_compiled_hello_response_ = createGrpcResponse("Hello from HFT-optimized server!");
-    pre_compiled_error_response_ = createGrpcResponse("Error processing request");
+    try {
+        pre_compiled_hello_response_ = createGrpcResponse("Hello from HFT-optimized server!");
+        pre_compiled_error_response_ = createGrpcResponse("Error processing request");
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to pre-compile responses: " << e.what() << std::endl;
+        // Create simple fallback responses
+        pre_compiled_hello_response_ = {0x00, 0x00, 0x1A, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x48, 0x65, 0x6C, 0x6C, 0x6F, 0x20, 0x66, 0x72, 0x6F, 0x6D, 0x20, 0x48, 0x46, 0x54, 0x20, 0x73, 0x65, 0x72, 0x76, 0x65, 0x72};
+        pre_compiled_error_response_ = {0x00, 0x00, 0x0F, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x45, 0x72, 0x72, 0x6F, 0x72};
+    }
     
     // Optimize memory layout for cache efficiency
     optimizeMemoryLayout();
